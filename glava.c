@@ -143,7 +143,7 @@ static void copy_cfg(const char* path, const char* dest, bool verbose) {
                 if (source > 0) close(source);
                 if (dest > 0) close(dest);
             }
-            break;
+                break;
             case 2:
                 if (symlink(p, f) && errno != EEXIST)
                     fprintf(stderr, "failed to symlink '%s' -> '%s': %s\n", p, f, strerror(errno));
@@ -167,9 +167,10 @@ static const char* help_str =
     "-d, --desktop           enables running glava as a desktop window by detecting the\n"
     "                          desktop environment and setting the appropriate properties\n"
     "                          automatically. Can override properties in \"rc.glsl\".\n"
+    "-r, --request=REQUEST   evaluates the specified request after loading \"rc.glsl\".\n"
     "-m, --force-mod=NAME    forces the specified module to load instead, ignoring any\n"
     "                          `#request mod` instances in the entry point.\n"
-    "-e, --entry=NAME        specifies the name of the file to look for when loading shaders,\n"
+    "-e, --entry=FILE        specifies the name of the file to look for when loading shaders,\n"
     "                          by default this is \"rc.glsl\".\n"
     "-C, --copy-config       creates copies and symbolic links in the user configuration\n"
     "                          directory for glava, copying any files in the root directory\n"
@@ -177,18 +178,26 @@ static const char* help_str =
     "-b, --backend           specifies a window creation backend to use. By default, the most\n"
     "                          appropriate backend will be used for the underlying windowing\n"
     "                          system.\n"
-    "-a, --audio-backend     specifies the audio backend to use: jack, pulseaudio.\n"
-    "                          Default: pulseaudio.\n"
+    "-a, --audio-backend     specifies the audio backend to use: jack, pulseaudio (default).\n"
     "-V, --version           print application version and exit\n"
     "\n"
-    GLAVA_VERSION_STRING "\n"
-    " -- Copyright (C) 2017 Levi Webb\n";
+    "The REQUEST argument is evaluated identically to the \'#request\' preprocessor directive\n"
+    "in GLSL files.\n"
+    "\n"
+    "The DEFINE argument is appended to the associated file before it is processed. It is\n"
+    "evaluated identically to the \'#define' preprocessor directive.\n"
+    "\n"
+    "The FILE argument may be any file path. All specified file paths are relative to the\n"
+    "active configuration root (usually ~/.config/glava if present).\n"
+    "\n"
+    GLAVA_VERSION_STRING "\n";
 
-static const char* opt_str = "dhvVe:Cm:b:a:";
+static const char* opt_str = "dhvVe:Cm:b:a:r:";
 static struct option p_opts[] = {
     {"help",         no_argument,       0, 'h'},
     {"verbose",      no_argument,       0, 'v'},
     {"desktop",      no_argument,       0, 'd'},
+    {"request",     required_argument, 0, 'r'},
     {"entry",        required_argument, 0, 'e'},
     {"force-mod",    required_argument, 0, 'm'},
     {"copy-config",  no_argument,       0, 'C'},
@@ -200,40 +209,50 @@ static struct option p_opts[] = {
 
 static renderer* rd = NULL;
 
-void handle_term(int signum) {
+static void handle_term(int signum) {
     if (rd->alive) {
         puts("\nInterrupt recieved, closing...");
         rd->alive = false;
     }
 }
-
-enum AudioBackend
-{
+    
+enum audio_impl {
     PULSEAUDIO = 0,
     JACK
 };
+    
+static inline void append_buf(char** buf, size_t* sz_store, char* str) {
+    buf = realloc(buf, ++(*sz_store) * sizeof(char*));
+    buf[*sz_store - 1] = str;
+}
 
 int main(int argc, char** argv) {
 
     /* Evaluate these macros only once, since they allocate */
-    const char* install_path = SHADER_INSTALL_PATH;
-    const char* user_path    = SHADER_USER_PATH;
-    const char* entry        = "rc.glsl";
-    const char* force        = NULL;
-    const char* backend      = NULL;
-    const char* audio_backend = "pulseaudio";
+    const char
+        * install_path  = SHADER_INSTALL_PATH,
+        * user_path     = SHADER_USER_PATH,
+        * entry         = "rc.glsl",
+        * force         = NULL,
+        * backend       = NULL,
+        * audio_backend = "pulseaudio";
     const char* system_shader_paths[] = { user_path, install_path, NULL };
+    
+    char** requests    = malloc(1);
+    size_t requests_sz = 0;
+    
     bool verbose = false, copy_mode = false, desktop = false;
     
     int c, idx;
     while ((c = getopt_long(argc, argv, opt_str, p_opts, &idx)) != -1) {
         switch (c) {
-            case 'v': verbose       = true;   break;
-            case 'C': copy_mode     = true;   break;
-            case 'd': desktop       = true;   break;
-            case 'e': entry         = optarg; break;
-            case 'm': force         = optarg; break;
-            case 'b': backend       = optarg; break;
+            case 'v': verbose   = true;   break;
+            case 'C': copy_mode = true;   break;
+            case 'd': desktop   = true;   break;
+            case 'r': append_buf(requests, &requests_sz, optarg); break;
+            case 'e': entry     = optarg; break;
+            case 'm': force     = optarg; break;
+            case 'b': backend   = optarg; break;
             case 'a': audio_backend = optarg; break;
             case '?': exit(EXIT_FAILURE); break;
             case 'V':
@@ -248,33 +267,39 @@ int main(int argc, char** argv) {
         }
     }
 
-    enum AudioBackend a_back;
-    if (strcmp(audio_backend, "pulseaudio") == 0)
-        {
-            a_back = PULSEAUDIO;
-        }
-    else if(strcmp(audio_backend, "jack") == 0)
-        {
-#ifdef GLAVA_JACK_SUPPORT
-            a_back = JACK;
-#else
-            printf("ERROR: Current build don't support jack audio backend.\n");
-            exit(EXIT_SUCCESS);
-#endif
-        }
-    else
-        {
-            printf("ERROR: Unknown audio backend: %s\n\n", audio_backend);
-            printf(help_str, argc > 0 ? argv[0] : "glava");
-            exit(EXIT_SUCCESS);
-        }
+    enum audio_impl a_back;
+    if (strcmp(audio_backend, "pulseaudio") == 0) {
+        a_back = PULSEAUDIO;
+    } else if(strcmp(audio_backend, "jack") == 0) {
+        #ifdef GLAVA_JACK_SUPPORT
+        a_back = JACK;
+        #else
+        printf("ERROR: Current build does not support jack audio backend.\n");
+        exit(EXIT_SUCCESS);
+        #endif
+    } else {
+        printf("ERROR: Unknown audio backend: %s\n", audio_backend);
+        exit(EXIT_FAILURE);
+    }
 
     if (copy_mode) {
         copy_cfg(install_path, user_path, verbose);
         exit(EXIT_SUCCESS);
     }
 
-    rd = rd_new(system_shader_paths, entry, force, backend, desktop);
+    /* Handle `--force` argument as a request override */
+    if (force) {
+        const size_t bsz = 5 + strlen(force);
+        char* force_req_buf = malloc(bsz);
+        snprintf(force_req_buf, bsz, "mod %s", force);
+        append_buf(requests, &requests_sz, force_req_buf);
+    }
+
+    /* Null terminate array arguments */
+    append_buf(requests, &requests_sz, NULL);
+
+    rd = rd_new(system_shader_paths, entry, (const char**) requests,
+                backend, desktop, verbose);
     
     struct sigaction action = { .sa_handler = handle_term };
     sigaction(SIGTERM, &action, NULL);
@@ -306,30 +331,29 @@ int main(int argc, char** argv) {
         .sample_sz    = rd->samplesize_request,
         .modified     = false
     };
-
+    
     pthread_t thread;
-    switch (a_back)
-        {
-            case PULSEAUDIO:
-                if (!audio.source)
-                    {
-                        get_pulse_default_sink(&audio);
-                        printf("Using default PulseAudio sink: %s\n", audio.source);
-                    }
-                    pthread_create(&thread, NULL, input_pulse, (void*) &audio);
-                break;
-#ifdef GLAVA_JACK_SUPPORT
-            case JACK: init_jack_client(&audio); break;
-#endif
-        }
+    switch (a_back) {
+        case PULSEAUDIO:
+            if (!audio.source) {
+                get_pulse_default_sink(&audio);
+                if (verbose) printf("Using default PulseAudio sink: %s\n", audio.source);
+            }
+            pthread_create(&thread, NULL, input_pulse, (void*) &audio);
+            break;
+            #ifdef GLAVA_JACK_SUPPORT
+        case JACK: init_jack_client(&audio); break;
+            #endif
+        default: break;
+    }
 
     float lb[rd->bufsize_request], rb[rd->bufsize_request];
     while (rd->alive) {
-
+        
         rd_time(rd); /* update timer for this frame */
         
         bool modified; /* if the audio buffer has been updated by the streaming thread */
-
+        
         /* lock the audio mutex and read our data */
         pthread_mutex_lock(&audio.mutex);
         modified = audio.modified;
@@ -350,21 +374,21 @@ int main(int argc, char** argv) {
             nanosleep(&tv, NULL);
         }
     }
-
-    switch (a_back)
-        {
-            case PULSEAUDIO:
-                audio.terminate = 1;
-                int return_status;
-                if ((return_status = pthread_join(thread, NULL))) {
-                    fprintf(stderr, "Failed to join with audio thread: %s\n", strerror(return_status));
-                }
-                break;
-#ifdef GLAVA_JACK_SUPPORT
-            case JACK: close_jack_client(); break;
-#endif
-        }
-
+        
+    switch (a_back) {
+        case PULSEAUDIO:
+            audio.terminate = 1;
+            int return_status;
+            if ((return_status = pthread_join(thread, NULL))) {
+                fprintf(stderr, "Failed to join with audio thread: %s\n", strerror(return_status));
+            }
+            break;
+            #ifdef GLAVA_JACK_SUPPORT
+        case JACK: close_jack_client(); break;
+            #endif
+        default: break;
+    }
+        
     free(audio.source);
     rd_destroy(rd);
 }

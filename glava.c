@@ -332,6 +332,7 @@ int main(int argc, char** argv) {
         .modified     = false
     };
     
+    void* audio_input;
     pthread_t thread;
     switch (a_back) {
         case PULSEAUDIO:
@@ -342,7 +343,7 @@ int main(int argc, char** argv) {
             pthread_create(&thread, NULL, input_pulse, (void*) &audio);
             break;
             #ifdef GLAVA_JACK_SUPPORT
-        case JACK: init_jack_client(&audio); break;
+        case JACK: audio_input = init_jack_client(&audio, verbose); break;
             #endif
         default: break;
     }
@@ -384,7 +385,7 @@ int main(int argc, char** argv) {
             }
             break;
             #ifdef GLAVA_JACK_SUPPORT
-        case JACK: close_jack_client(); break;
+        case JACK: close_jack_client(audio_input); break;
             #endif
         default: break;
     }

@@ -7,30 +7,37 @@
 #include <errno.h>
 #include <jack/jack.h>
 
-jack_port_t *left_input_port;
-jack_port_t *right_input_port = NULL;
-jack_client_t *client;
-
 #include "fifo.h"
+#include "jack_input.h"
+
+struct jack_input
+{
+    jack_port_t *left_input_port;
+    jack_port_t *right_input_port;
+    jack_client_t *client;
+    struct audio_data *audio;
+    bool verbose;
+};
+
 
 int process(jack_nframes_t nframes, void *arg) {
 
-    struct audio_data* audio = (struct audio_data*) arg;
+    struct jack_input* jack = (struct jack_input*) arg;
 
-    float* bl = (float*) audio->audio_out_l;
-    float* br = (float*) audio->audio_out_r;
-    size_t fsz = audio->audio_buf_sz;
+    float* bl = (float*) jack->audio->audio_out_l;
+    float* br = (float*) jack->audio->audio_out_r;
+    size_t fsz = jack->audio->audio_buf_sz;
 
-    pthread_mutex_lock(&audio->mutex);
+    pthread_mutex_lock(&jack->audio->mutex);
 
     memmove(bl, &bl[nframes], (fsz - nframes) * sizeof(float));
     memmove(br, &br[nframes], (fsz - nframes) * sizeof(float));
 
     jack_default_audio_sample_t *left_in, *right_in;
 
-    left_in = (jack_default_audio_sample_t*) jack_port_get_buffer (left_input_port, nframes);
-    if (right_input_port) {
-        right_in = (jack_default_audio_sample_t*) jack_port_get_buffer (right_input_port, nframes);
+    left_in = (jack_default_audio_sample_t*) jack_port_get_buffer (jack->left_input_port, nframes);
+    if (jack->right_input_port) {
+        right_in = (jack_default_audio_sample_t*) jack_port_get_buffer (jack->right_input_port, nframes);
     }
 
     for (unsigned int i = 0; i < nframes; ++i) {
@@ -38,18 +45,18 @@ int process(jack_nframes_t nframes, void *arg) {
         size_t idx = (fsz - nframes) + i;
         bl[idx] = left_in[i];
 
-        if (audio->channels == 1) {
+        if (jack->audio->channels == 1) {
             br[idx] = left_in[i];
         }
 
         /* stereo storing channels in buffer */
-        if (audio->channels == 2) {
+        if (jack->audio->channels == 2) {
             br[idx] = right_in[i];
         }
     }
-    audio->modified = true;
+    jack->audio->modified = true;
 
-    pthread_mutex_unlock(&audio->mutex);
+    pthread_mutex_unlock(&jack->audio->mutex);
     return 0;
 }
 
@@ -57,11 +64,17 @@ void jack_shutdown(void *arg) {
     // exit(1);
 }
 
-void init_jack_client(struct audio_data* audio) {
+jack_input_ptr init_jack_client(struct audio_data* audio, bool verbose) {
+
+    struct jack_input* jack = malloc(sizeof(struct jack_input));
+    jack->audio = audio;
+    jack->verbose = verbose;
+    jack->right_input_port = NULL;
+
     jack_status_t status;
 
-    client = jack_client_open("glava", JackNullOption, &status);
-    if (client == NULL) {
+    jack->client = jack_client_open("glava", JackNullOption, &status);
+    if (jack->client == NULL) {
         fprintf(stderr, "jack_client_open() failed, "
                 "status = 0x%2.0x\n", status);
         if (status & JackServerFailed) {
@@ -70,40 +83,43 @@ void init_jack_client(struct audio_data* audio) {
         exit(EXIT_FAILURE);
     }
     if (status & JackServerStarted) {
-        fprintf(stderr, "JACK server started\n");
+        if (verbose) fprintf(stderr, "JACK server started\n");
     }
 
-    jack_set_process_callback(client, process, audio);
-    jack_on_shutdown(client, jack_shutdown, 0);
+    jack_set_process_callback(jack->client, process, jack);
+    jack_on_shutdown(jack->client, jack_shutdown, 0);
 
-    audio->rate = jack_get_sample_rate(client);
-    audio->sample_sz = jack_get_buffer_size(client) * 4;
+    audio->rate = jack_get_sample_rate(jack->client);
+    audio->sample_sz = jack_get_buffer_size(jack->client) * 4;
 
     printf("JACK: sample rate/size was overwritten, new values: %i, %i\n",
            (int) audio->rate, (int) audio->sample_sz);
 
     if (audio->sample_sz / 4 > audio->audio_buf_sz) {
-        printf("ERROR: audio buffer is too small: %i\n", audio->audio_buf_sz);
+        printf("ERROR: audio buffer is too small: %li\n", audio->audio_buf_sz);
         exit(EXIT_FAILURE);
     }
 
-    left_input_port = jack_port_register(client, "L",
-                                         JACK_DEFAULT_AUDIO_TYPE,
-                                         JackPortIsInput, 0);
+    jack->left_input_port = jack_port_register(jack->client, "L",
+                                               JACK_DEFAULT_AUDIO_TYPE,
+                                               JackPortIsInput, 0);
 
     if (audio->channels == 2) {
-        right_input_port = jack_port_register(client, "R",
-                                              JACK_DEFAULT_AUDIO_TYPE,
-                                              JackPortIsInput, 0);
+        jack->right_input_port = jack_port_register(jack->client, "R",
+                                                    JACK_DEFAULT_AUDIO_TYPE,
+                                                    JackPortIsInput, 0);
     }
 
-    if (jack_activate(client)) {
+    if (jack_activate(jack->client)) {
         fprintf(stderr, "Cannot activate jack client\n");
         exit(EXIT_FAILURE);
     }
+    return (jack_input_ptr)jack;
 }
 
-void close_jack_client() {
-    jack_client_close (client);
+void close_jack_client(jack_input_ptr jack_ptr) {
+    struct jack_input* jack = (struct jack_input*)jack_ptr;
+    jack_client_close (jack->client);
+    free(jack);
 }
 #endif

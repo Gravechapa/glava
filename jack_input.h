@@ -1,4 +1,5 @@
 #pragma once
+#include <pthread.h>
 
 typedef void* jack_input_ptr;
 

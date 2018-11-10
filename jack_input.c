@@ -10,12 +10,19 @@
 #include "fifo.h"
 #include "jack_input.h"
 
+
 struct jack_input
 {
     jack_port_t *left_input_port;
     jack_port_t *right_input_port;
     jack_client_t *client;
     struct audio_data *audio;
+
+    int terminate;
+    pthread_t monitoring_thread;
+    pthread_spinlock_t terminate_sync;
+    pthread_barrier_t barrier;
+
     bool verbose;
 };
 
@@ -23,6 +30,15 @@ struct jack_input
 int process(jack_nframes_t nframes, void *arg) {
 
     struct jack_input* jack = (struct jack_input*) arg;
+
+    pthread_spin_lock(&jack->terminate_sync);
+    if (jack->terminate == 1) {
+        jack->terminate = 2;
+        pthread_barrier_wait(&jack->barrier);
+        pthread_spin_unlock(&jack->terminate_sync);
+        return 0;
+    }
+    pthread_spin_unlock(&jack->terminate_sync);
 
     float* bl = (float*) jack->audio->audio_out_l;
     float* br = (float*) jack->audio->audio_out_r;
@@ -60,8 +76,121 @@ int process(jack_nframes_t nframes, void *arg) {
     return 0;
 }
 
+void jack_shutdown(void *arg);
+
+bool configure(struct jack_input* jack){
+
+    jack_set_process_callback(jack->client, process, jack);
+    jack_on_shutdown(jack->client, jack_shutdown, jack);
+
+    jack->audio->rate = jack_get_sample_rate(jack->client);
+    jack->audio->sample_sz = jack_get_buffer_size(jack->client) * 4;
+
+    printf("JACK: sample rate/size was overwritten, new values: %i, %i\n",
+           (int) jack->audio->rate, (int) jack->audio->sample_sz);
+
+    if (jack->audio->sample_sz / 4 > jack->audio->audio_buf_sz) {
+        fprintf(stderr, "ERROR: audio buffer is too small: %li\n", jack->audio->audio_buf_sz);
+        return false;
+    }
+
+    if (jack->audio->channels == 1) {
+        jack->left_input_port = jack_port_register(jack->client, "Mono",
+                                                   JACK_DEFAULT_AUDIO_TYPE,
+                                                   JackPortIsInput, 0);
+    } else {
+        jack->left_input_port = jack_port_register(jack->client, "L",
+                                                   JACK_DEFAULT_AUDIO_TYPE,
+                                                   JackPortIsInput, 0);
+        jack->right_input_port = jack_port_register(jack->client, "R",
+                                                    JACK_DEFAULT_AUDIO_TYPE,
+                                                    JackPortIsInput, 0);
+    }
+
+    if (jack_activate(jack->client)) {
+        fprintf(stderr, "Cannot activate jack client\n");
+        return false;
+    }
+    return true;
+}
+
+void* monitor(void* jack_ptr){
+
+    struct jack_input* jack = (struct jack_input*)jack_ptr;
+    while (true){
+
+        pthread_spin_lock(&jack->terminate_sync);
+        if (jack->terminate == 1) {
+            jack->terminate = 2;
+            pthread_barrier_wait(&jack->barrier);
+            pthread_spin_unlock(&jack->terminate_sync);
+            return 0;
+        }
+        if (jack->terminate == 2) {
+            pthread_spin_unlock(&jack->terminate_sync);
+            return 0;
+        }
+        pthread_spin_unlock(&jack->terminate_sync);
+
+        jack_status_t status;
+
+        jack->client = jack_client_open("glava", JackNoStartServer, &status);
+        if (jack->client != NULL) {
+            break;
+        }
+
+        if (jack->verbose) fprintf(stderr, "jack_client_open() failed, "
+                "status = 0x%2.0x\n", status);
+        if (status & JackServerFailed) {
+            if (jack->verbose) fprintf(stderr, "Unable to connect to JACK server\n");
+        }
+
+        ///bypass to clear screen/////////////////
+        pthread_mutex_lock(&jack->audio->mutex);
+        jack->audio->modified = true;
+        pthread_mutex_unlock(&jack->audio->mutex);
+        ///////////////////////////////////////////
+
+        /* Sleep for 500ms and then attempt to connect again */
+        struct timespec tv = {
+            .tv_sec = 0, .tv_nsec = 500 * 1000000
+        };
+        nanosleep(&tv, NULL);
+    }
+    configure(jack);
+    return 0;
+}
+
 void jack_shutdown(void *arg) {
-    // exit(1);
+
+    int return_status;
+
+    struct jack_input* jack = (struct jack_input*) arg;
+
+    pthread_spin_lock(&jack->terminate_sync);
+    if (jack->terminate == 1) {
+        jack->terminate = 2;
+        pthread_barrier_wait(&jack->barrier);
+        pthread_spin_unlock(&jack->terminate_sync);
+        return;
+    }
+    if (jack->terminate == 2) {
+        pthread_spin_unlock(&jack->terminate_sync);
+        return;
+    }
+    pthread_spin_unlock(&jack->terminate_sync);
+
+    if (jack->monitoring_thread) {
+        if ((return_status = pthread_join(jack->monitoring_thread, NULL))) {
+            fprintf(stderr, "Failed to join with audio thread: %s\n", strerror(return_status));
+        }
+    }
+    jack->client = NULL;
+
+    if ((return_status = pthread_create(&jack->monitoring_thread, NULL, &monitor, (void*) jack))) {
+        fprintf(stderr, "Failed to create monitoring thread for jack: %i\n", return_status);
+        exit(EXIT_FAILURE);
+    }
 }
 
 jack_input_ptr init_jack_client(struct audio_data* audio, bool verbose) {
@@ -70,6 +199,10 @@ jack_input_ptr init_jack_client(struct audio_data* audio, bool verbose) {
     jack->audio = audio;
     jack->verbose = verbose;
     jack->right_input_port = NULL;
+    jack->terminate = 0;
+    jack->monitoring_thread = 0;
+    pthread_spin_init(&jack->terminate_sync, 0);
+    pthread_barrier_init(&jack->barrier, NULL, 2);
 
     jack_status_t status;
 
@@ -86,40 +219,36 @@ jack_input_ptr init_jack_client(struct audio_data* audio, bool verbose) {
         if (verbose) fprintf(stderr, "JACK server started\n");
     }
 
-    jack_set_process_callback(jack->client, process, jack);
-    jack_on_shutdown(jack->client, jack_shutdown, 0);
-
-    audio->rate = jack_get_sample_rate(jack->client);
-    audio->sample_sz = jack_get_buffer_size(jack->client) * 4;
-
-    printf("JACK: sample rate/size was overwritten, new values: %i, %i\n",
-           (int) audio->rate, (int) audio->sample_sz);
-
-    if (audio->sample_sz / 4 > audio->audio_buf_sz) {
-        printf("ERROR: audio buffer is too small: %li\n", audio->audio_buf_sz);
-        exit(EXIT_FAILURE);
-    }
-
-    jack->left_input_port = jack_port_register(jack->client, "L",
-                                               JACK_DEFAULT_AUDIO_TYPE,
-                                               JackPortIsInput, 0);
-
-    if (audio->channels == 2) {
-        jack->right_input_port = jack_port_register(jack->client, "R",
-                                                    JACK_DEFAULT_AUDIO_TYPE,
-                                                    JackPortIsInput, 0);
-    }
-
-    if (jack_activate(jack->client)) {
-        fprintf(stderr, "Cannot activate jack client\n");
+    if (!configure(jack)) {
         exit(EXIT_FAILURE);
     }
     return (jack_input_ptr)jack;
 }
 
 void close_jack_client(jack_input_ptr jack_ptr) {
+
     struct jack_input* jack = (struct jack_input*)jack_ptr;
-    jack_client_close (jack->client);
+
+    pthread_spin_lock(&jack->terminate_sync);
+    jack->terminate = 1;
+    pthread_spin_unlock(&jack->terminate_sync);
+
+    pthread_barrier_wait(&jack->barrier);
+
+    int return_status;
+
+    if (jack->monitoring_thread) {
+        if ((return_status = pthread_join(jack->monitoring_thread, NULL))) {
+            fprintf(stderr, "Failed to join with audio thread: %s\n", strerror(return_status));
+        }
+    }
+
+    if (jack->client) {
+        jack_client_close (jack->client);
+    }
+
+    pthread_spin_destroy(&jack->terminate_sync);
+    pthread_barrier_destroy(&jack->barrier);
     free(jack);
 }
 #endif

@@ -120,9 +120,12 @@ bool configure(struct jack_input* jack){
     return true;
 }
 
+void  silent_jack_error_callback(const char *msg){}
+
 void* monitor(void* jack_ptr){
 
     struct jack_input* jack = (struct jack_input*)jack_ptr;
+    jack_set_error_function(silent_jack_error_callback);
     while (true){
 
         pthread_spin_lock(&jack->state_sync);
@@ -163,6 +166,7 @@ void* monitor(void* jack_ptr){
         };
         nanosleep(&tv, NULL);
     }
+    jack_set_error_function(NULL);
     configure(jack);
     return 0;
 }

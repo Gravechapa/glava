@@ -10,6 +10,12 @@
 #include "fifo.h"
 #include "jack_input.h"
 
+enum client_state
+{
+    WORKING,
+    PREPARING_TO_TERMINATE,
+    TERMINATING
+};
 
 struct jack_input
 {
@@ -18,9 +24,9 @@ struct jack_input
     jack_client_t *client;
     struct audio_data *audio;
 
-    int terminate;
+    enum client_state state;
     pthread_t monitoring_thread;
-    pthread_spinlock_t terminate_sync;
+    pthread_spinlock_t state_sync;
     pthread_barrier_t barrier;
 
     bool verbose;
@@ -31,14 +37,14 @@ int process(jack_nframes_t nframes, void *arg) {
 
     struct jack_input* jack = (struct jack_input*) arg;
 
-    pthread_spin_lock(&jack->terminate_sync);
-    if (jack->terminate == 1) {
-        jack->terminate = 2;
+    pthread_spin_lock(&jack->state_sync);
+    if (jack->state == PREPARING_TO_TERMINATE) {
+        jack->state = TERMINATING;
         pthread_barrier_wait(&jack->barrier);
-        pthread_spin_unlock(&jack->terminate_sync);
+        pthread_spin_unlock(&jack->state_sync);
         return 0;
     }
-    pthread_spin_unlock(&jack->terminate_sync);
+    pthread_spin_unlock(&jack->state_sync);
 
     float* bl = (float*) jack->audio->audio_out_l;
     float* br = (float*) jack->audio->audio_out_r;
@@ -84,12 +90,12 @@ bool configure(struct jack_input* jack){
     jack_on_shutdown(jack->client, jack_shutdown, jack);
 
     jack->audio->rate = jack_get_sample_rate(jack->client);
-    jack->audio->sample_sz = jack_get_buffer_size(jack->client) * 4;
+    jack->audio->sample_sz = jack_get_buffer_size(jack->client) * sizeof(float);
 
     printf("JACK: sample rate/size was overwritten, new values: %i, %i\n",
            (int) jack->audio->rate, (int) jack->audio->sample_sz);
 
-    if (jack->audio->sample_sz / 4 > jack->audio->audio_buf_sz) {
+    if (jack->audio->sample_sz / sizeof(float) > jack->audio->audio_buf_sz) {
         fprintf(stderr, "ERROR: audio buffer is too small: %li\n", jack->audio->audio_buf_sz);
         return false;
     }
@@ -119,18 +125,18 @@ void* monitor(void* jack_ptr){
     struct jack_input* jack = (struct jack_input*)jack_ptr;
     while (true){
 
-        pthread_spin_lock(&jack->terminate_sync);
-        if (jack->terminate == 1) {
-            jack->terminate = 2;
+        pthread_spin_lock(&jack->state_sync);
+        if (jack->state == PREPARING_TO_TERMINATE) {
+            jack->state = TERMINATING;
             pthread_barrier_wait(&jack->barrier);
-            pthread_spin_unlock(&jack->terminate_sync);
+            pthread_spin_unlock(&jack->state_sync);
             return 0;
         }
-        if (jack->terminate == 2) {
-            pthread_spin_unlock(&jack->terminate_sync);
+        if (jack->state == TERMINATING) {
+            pthread_spin_unlock(&jack->state_sync);
             return 0;
         }
-        pthread_spin_unlock(&jack->terminate_sync);
+        pthread_spin_unlock(&jack->state_sync);
 
         jack_status_t status;
 
@@ -167,18 +173,18 @@ void jack_shutdown(void *arg) {
 
     struct jack_input* jack = (struct jack_input*) arg;
 
-    pthread_spin_lock(&jack->terminate_sync);
-    if (jack->terminate == 1) {
-        jack->terminate = 2;
+    pthread_spin_lock(&jack->state_sync);
+    if (jack->state == PREPARING_TO_TERMINATE) {
+        jack->state = TERMINATING;
         pthread_barrier_wait(&jack->barrier);
-        pthread_spin_unlock(&jack->terminate_sync);
+        pthread_spin_unlock(&jack->state_sync);
         return;
     }
-    if (jack->terminate == 2) {
-        pthread_spin_unlock(&jack->terminate_sync);
+    if (jack->state == TERMINATING) {
+        pthread_spin_unlock(&jack->state_sync);
         return;
     }
-    pthread_spin_unlock(&jack->terminate_sync);
+    pthread_spin_unlock(&jack->state_sync);
 
     if (jack->monitoring_thread) {
         if ((return_status = pthread_join(jack->monitoring_thread, NULL))) {
@@ -199,9 +205,9 @@ jack_input_ptr init_jack_client(struct audio_data* audio, bool verbose) {
     jack->audio = audio;
     jack->verbose = verbose;
     jack->right_input_port = NULL;
-    jack->terminate = 0;
+    jack->state = WORKING;
     jack->monitoring_thread = 0;
-    pthread_spin_init(&jack->terminate_sync, 0);
+    pthread_spin_init(&jack->state_sync, 0);
     pthread_barrier_init(&jack->barrier, NULL, 2);
 
     jack_status_t status;
@@ -229,9 +235,9 @@ void close_jack_client(jack_input_ptr jack_ptr) {
 
     struct jack_input* jack = (struct jack_input*)jack_ptr;
 
-    pthread_spin_lock(&jack->terminate_sync);
-    jack->terminate = 1;
-    pthread_spin_unlock(&jack->terminate_sync);
+    pthread_spin_lock(&jack->state_sync);
+    jack->state = PREPARING_TO_TERMINATE;
+    pthread_spin_unlock(&jack->state_sync);
 
     pthread_barrier_wait(&jack->barrier);
 
@@ -247,7 +253,7 @@ void close_jack_client(jack_input_ptr jack_ptr) {
         jack_client_close (jack->client);
     }
 
-    pthread_spin_destroy(&jack->terminate_sync);
+    pthread_spin_destroy(&jack->state_sync);
     pthread_barrier_destroy(&jack->barrier);
     free(jack);
 }

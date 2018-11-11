@@ -92,6 +92,7 @@ bool configure(struct jack_input* jack){
     jack->audio->rate = jack_get_sample_rate(jack->client);
     jack->audio->sample_sz = jack_get_buffer_size(jack->client) * sizeof(float);
 
+    if (jack->verbose) printf("JACK client name: %s\n", jack_get_client_name(jack->client));
     printf("JACK: sample rate/size was overwritten, new values: %i, %i\n",
            (int) jack->audio->rate, (int) jack->audio->sample_sz);
 
@@ -114,7 +115,7 @@ bool configure(struct jack_input* jack){
     }
 
     if (jack_activate(jack->client)) {
-        fprintf(stderr, "Cannot activate jack client\n");
+        fprintf(stderr, "Cannot activate JACK client\n");
         return false;
     }
     return true;
@@ -198,7 +199,7 @@ void jack_shutdown(void *arg) {
     jack->client = NULL;
 
     if ((return_status = pthread_create(&jack->monitoring_thread, NULL, &monitor, (void*) jack))) {
-        fprintf(stderr, "Failed to create monitoring thread for jack: %i\n", return_status);
+        fprintf(stderr, "Failed to create monitoring thread for JACK: %i\n", return_status);
         exit(EXIT_FAILURE);
     }
 }

@@ -10,15 +10,13 @@
 #include "fifo.h"
 #include "jack_input.h"
 
-enum client_state
-{
+enum client_state {
     WORKING,
     PREPARING_TO_TERMINATE,
     TERMINATING
 };
 
-struct jack_input
-{
+struct jack_input {
     jack_port_t *left_input_port;
     jack_port_t *right_input_port;
     jack_client_t *client;
@@ -84,7 +82,7 @@ int process(jack_nframes_t nframes, void *arg) {
 
 void jack_shutdown(void *arg);
 
-bool configure(struct jack_input* jack){
+bool configure(struct jack_input* jack) {
 
     jack_set_process_callback(jack->client, process, jack);
     jack_on_shutdown(jack->client, jack_shutdown, jack);
@@ -121,13 +119,13 @@ bool configure(struct jack_input* jack){
     return true;
 }
 
-void  silent_jack_error_callback(const char *msg){}
+void  silent_jack_error_callback(const char *msg) {}
 
-void* monitor(void* jack_ptr){
+void* monitor(void* jack_ptr) {
 
     struct jack_input* jack = (struct jack_input*)jack_ptr;
     jack_set_error_function(silent_jack_error_callback);
-    while (true){
+    while (true) {
 
         pthread_spin_lock(&jack->state_sync);
         if (jack->state == PREPARING_TO_TERMINATE) {
@@ -155,7 +153,7 @@ void* monitor(void* jack_ptr){
             if (jack->verbose) fprintf(stderr, "Unable to connect to JACK server\n");
         }
 
-        ///bypass to clear screen/////////////////
+        //////////bypass to clear screen///////////
         pthread_mutex_lock(&jack->audio->mutex);
         jack->audio->modified = true;
         pthread_mutex_unlock(&jack->audio->mutex);

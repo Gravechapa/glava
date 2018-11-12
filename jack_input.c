@@ -166,7 +166,9 @@ void* monitor(void* jack_ptr) {
         nanosleep(&tv, NULL);
     }
     jack_set_error_function(NULL);
-    configure(jack);
+    if (!configure(jack)) {
+        exit(EXIT_FAILURE);
+    }
     return 0;
 }
 

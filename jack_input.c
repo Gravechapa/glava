@@ -39,8 +39,6 @@ int process(jack_nframes_t nframes, void *arg) {
     if (jack->state == PREPARING_TO_TERMINATE) {
         jack->state = TERMINATING;
         pthread_barrier_wait(&jack->barrier);
-        pthread_spin_unlock(&jack->state_sync);
-        return 0;
     }
     pthread_spin_unlock(&jack->state_sync);
 
@@ -91,11 +89,11 @@ bool configure(struct jack_input* jack) {
     jack->audio->sample_sz = jack_get_buffer_size(jack->client) * sizeof(float);
 
     if (jack->verbose) printf("JACK client name: %s\n", jack_get_client_name(jack->client));
-    printf("JACK: sample rate/size was overwritten, new values: %i, %i\n",
-           (int) jack->audio->rate, (int) jack->audio->sample_sz);
+    printf("JACK: sample rate/size was overwritten, new values: %u, %zi\n",
+           jack->audio->rate, jack->audio->sample_sz);
 
     if (jack->audio->sample_sz / sizeof(float) > jack->audio->audio_buf_sz) {
-        fprintf(stderr, "ERROR: audio buffer is too small: %li\n", jack->audio->audio_buf_sz);
+        fprintf(stderr, "ERROR: audio buffer is too small: %zi\n", jack->audio->audio_buf_sz);
         return false;
     }
 
@@ -125,6 +123,8 @@ void* monitor(void* jack_ptr) {
 
     struct jack_input* jack = (struct jack_input*)jack_ptr;
     jack_set_error_function(silent_jack_error_callback);
+    jack_client_close(jack->client);
+    jack->client = NULL;
     while (true) {
 
         pthread_spin_lock(&jack->state_sync);
@@ -193,10 +193,10 @@ void jack_shutdown(void *arg) {
 
     if (jack->monitoring_thread) {
         if ((return_status = pthread_join(jack->monitoring_thread, NULL))) {
-            fprintf(stderr, "Failed to join with audio thread: %s\n", strerror(return_status));
+            fprintf(stderr, "Failed to join with monitoring thread: %s\n", strerror(return_status));
+            exit(EXIT_FAILURE);
         }
     }
-    jack->client = NULL;
 
     if ((return_status = pthread_create(&jack->monitoring_thread, NULL, &monitor, (void*) jack))) {
         fprintf(stderr, "Failed to create monitoring thread for JACK: %i\n", return_status);
@@ -206,7 +206,7 @@ void jack_shutdown(void *arg) {
 
 jack_input_ptr init_jack_client(struct audio_data* audio, bool verbose) {
 
-    struct jack_input* jack = malloc(sizeof(struct jack_input));
+    struct jack_input* jack = (struct jack_input*)malloc(sizeof(struct jack_input));
     jack->audio = audio;
     jack->verbose = verbose;
     jack->right_input_port = NULL;
